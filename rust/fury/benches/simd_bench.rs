@@ -25,13 +25,27 @@ use std::arch::x86_64::*;
 #[cfg(target_feature = "avx2")]
 pub(crate) const MIN_DIM_SIZE_AVX: usize = 32;
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(any(
+    target_arch = "x86",
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_feature = "neon")
+))]
 pub(crate) const MIN_DIM_SIZE_SIMD: usize = 16;
+
+#[cfg(target_feature = "neon")]
+use std::arch::aarch64::*;
+
+fn is_latin_std(s: &str) -> bool {
+    s.bytes().all(|b| b.is_ascii())
+}
 
 #[cfg(target_feature = "sse2")]
 unsafe fn is_latin_sse(s: &str) -> bool {
+    if s.len() < MIN_DIM_SIZE_SIMD {
+        return is_latin_std(s);
+    }
     let bytes = s.as_bytes();
-    let len = s.len();
+    let len = bytes.len();
     let ascii_mask = _mm_set1_epi8(0x80u8 as i8);
     let remaining = len % MIN_DIM_SIZE_SIMD;
     let range_end = len - remaining;
@@ -53,6 +67,9 @@ unsafe fn is_latin_sse(s: &str) -> bool {
 
 #[cfg(target_feature = "avx2")]
 unsafe fn is_latin_avx(s: &str) -> bool {
+    if s.len() < MIN_DIM_SIZE_AVX {
+        return is_latin_std(s);
+    }
     let bytes = s.as_bytes();
     let len = s.len();
     let ascii_mask = _mm256_set1_epi8(0x80u8 as i8);
@@ -74,33 +91,65 @@ unsafe fn is_latin_avx(s: &str) -> bool {
     true
 }
 
-fn is_latin_std(s: &str) -> bool {
-    s.bytes().all(|b| b.is_ascii())
+#[cfg(target_feature = "neon")]
+unsafe fn is_latin_neon(s: &str) -> bool {
+    if s.len() < MIN_DIM_SIZE_SIMD {
+        return is_latin_std(s);
+    }
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let ascii_mask = vdupq_n_u8(0x80);
+    let remaining = len % MIN_DIM_SIZE_SIMD;
+    let range_end = len - remaining;
+    for i in (0..range_end).step_by(MIN_DIM_SIZE_SIMD) {
+        let chunk = vld1q_u8(bytes.as_ptr().add(i));
+        let masked = vandq_u8(chunk, ascii_mask);
+        let cmp = vceqq_u8(masked, vdupq_n_u8(0));
+        if vminvq_u8(cmp) == 0 {
+            return false;
+        }
+    }
+    for item in bytes.iter().take(len).skip(range_end) {
+        if !item.is_ascii() {
+            return false;
+        }
+    }
+    true
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
-    let test_str_short = "Hello, World!";
+    let test_str_short = "Hello, World!".repeat(100).to_owned();
     let test_str_long = "Hello, World! ".repeat(1000);
 
     #[cfg(target_feature = "sse2")]
     c.bench_function("SIMD sse short", |b| {
-        b.iter(|| unsafe { is_latin_sse(black_box(test_str_short)) })
+        b.iter(|| unsafe { is_latin_sse(black_box(&test_str_short)) })
     });
     #[cfg(target_feature = "sse2")]
     c.bench_function("SIMD sse long", |b| {
         b.iter(|| unsafe { is_latin_sse(black_box(&test_str_long)) })
     });
+
     #[cfg(target_feature = "avx2")]
     c.bench_function("SIMD avx short", |b| {
-        b.iter(|| unsafe { is_latin_avx(black_box(test_str_short)) })
+        b.iter(|| unsafe { is_latin_avx(black_box(&test_str_short)) })
     });
     #[cfg(target_feature = "avx2")]
     c.bench_function("SIMD avx long", |b| {
         b.iter(|| unsafe { is_latin_avx(black_box(&test_str_long)) })
     });
 
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    c.bench_function("SIMD meon short", |b| {
+        b.iter(|| unsafe { is_latin_neon(black_box(&test_str_short)) })
+    });
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    c.bench_function("SIMD meon long", |b| {
+        b.iter(|| unsafe { is_latin_neon(black_box(&test_str_long)) })
+    });
+
     c.bench_function("Standard short", |b| {
-        b.iter(|| is_latin_std(black_box(test_str_short)))
+        b.iter(|| is_latin_std(black_box(&test_str_short)))
     });
 
     c.bench_function("Standard long", |b| {

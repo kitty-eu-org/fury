@@ -23,6 +23,7 @@ mod row;
 mod serializer;
 mod types;
 mod util;
+mod util1;
 
 pub use deserializer::from_buffer;
 pub use error::Error;
