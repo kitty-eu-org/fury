@@ -40,7 +40,7 @@ fn swap_endian(value: u16) -> u16 {
 
 fn utf16_to_utf8(code_point: u16, offset: usize, ptr: *mut u8) -> usize {
     if code_point < 0x80u16 {
-        unsafe { ptr.add(1).write(code_point as u8) };
+        unsafe { ptr.add(offset).write(code_point as u8) };
         1
     } else if code_point < 0x800u16 {
         let bytes = [
@@ -120,7 +120,6 @@ unsafe fn to_utf8_avx(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, 
                 }
                 offset += 1;
             }
-            todo!();
         } else if _mm256_testz_si256(masked2, masked2) == 1 {
             for j in 0..MIN_TO_UTF8_DIM_AVX {
                 offset += utf16_to_utf8(utf16[i + j], offset, ptr)
@@ -141,7 +140,21 @@ unsafe fn to_utf8_avx(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, 
             }
         }
     }
-    Ok(Vec::new())
+
+    for i in range_end..utf16_len {
+        if i + 1 < utf16_len
+            && utf16[i] >= 0xD800u16
+            && utf16[i] <= 0xDBFFu16
+            && utf16[i + 1] >= 0xDC00u16
+            && utf16[i + 1] <= 0xDFFFu16
+        {
+            if !(0xdc00..=0xdfff).contains(&utf16[i + 1]) {
+                return Err("Invalid UTF-16 string: wrong surrogate pair".to_string());
+            }
+            offset += utf16_surrogate_pair_to_utf8(utf16[i], offset, ptr);
+        }
+    }
+    Ok(utf8_bytes)
 }
 
 #[cfg(target_feature = "sse2")]
@@ -182,7 +195,6 @@ unsafe fn to_utf8_sse(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, 
                 }
                 offset += 1;
             }
-            todo!();
         } else if _mm_testz_si128(masked2, masked2) == 1 {
             for j in 0..MIN_TO_UTF8_DIM_SIMD {
                 offset += utf16_to_utf8(utf16[i + j], offset, ptr)
@@ -191,7 +203,8 @@ unsafe fn to_utf8_sse(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, 
             for j in 0..MIN_TO_UTF8_DIM_SIMD {
                 if _mm_testz_si128(high_surrogate_masked, high_surrogate_masked) == 1  // surrogate_high_start < chunk < surrogate_high_end
                     && j + 1 < MIN_TO_UTF8_DIM_SIMD
-                    && _mm_testz_si128(low_surrogate_masked, low_surrogate_masked) == 0 // not surrogate_low_start < chunk < surrogate_low_end
+                    && _mm_testz_si128(low_surrogate_masked, low_surrogate_masked) == 0
+                // not surrogate_low_start < chunk < surrogate_low_end
                 {
                     if !(0xdc00..=0xdfff).contains(&utf16[i + j]) {
                         return Err("Invalid UTF-16 string: wrong surrogate pair".to_string());
@@ -203,7 +216,21 @@ unsafe fn to_utf8_sse(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, 
             }
         }
     }
-    Ok(Vec::new())
+
+    for i in range_end..utf16_len {
+        if i + 1 < utf16_len
+            && utf16[i] >= 0xD800u16
+            && utf16[i] <= 0xDBFFu16
+            && utf16[i + 1] >= 0xDC00u16
+            && utf16[i + 1] <= 0xDFFFu16
+        {
+            if !(0xdc00..=0xdfff).contains(&utf16[i + 1]) {
+                return Err("Invalid UTF-16 string: wrong surrogate pair".to_string());
+            }
+            offset += utf16_surrogate_pair_to_utf8(utf16[i], offset, ptr);
+        }
+    }
+    Ok(utf8_bytes)
 }
 
 #[cfg(target_feature = "neon")]
@@ -226,8 +253,8 @@ unsafe fn to_utf8_neon(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>,
         if !is_little_endian {
             chunk = vorrq_u16(vshlq_n_u16(chunk, 8), vshrq_n_u16(chunk, 8)); // Swap bytes for big-endian
         }
-        let masked1 = vandq_u16(chunk, limit1);
-        let masked2 = vandq_u16(chunk, limit2);
+        let masked1 = vcgtq_u16(chunk, limit1);
+        let masked2 = vcgtq_u16(chunk, limit2);
         let high_surrogate_masked = vandq_u16(
             vcgtq_u16(chunk, surrogate_high_start),
             vcltq_u16(chunk, surrogate_high_end),
@@ -236,6 +263,8 @@ unsafe fn to_utf8_neon(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>,
             vcgtq_u16(chunk, surrogate_low_start),
             vcltq_u16(chunk, surrogate_low_end),
         );
+        let res = vmaxvq_u16(masked1);
+        println!("res: {}", res);
         if vmaxvq_u16(masked1) == 0 {
             for j in 0..MIN_TO_UTF8_DIM_SIMD {
                 unsafe {
@@ -243,7 +272,6 @@ unsafe fn to_utf8_neon(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>,
                 }
                 offset += 1;
             }
-            todo!();
         } else if vmaxvq_u16(masked2) == 0 {
             for j in 0..MIN_TO_UTF8_DIM_SIMD {
                 offset += utf16_to_utf8(utf16[i + j], offset, ptr)
@@ -254,7 +282,7 @@ unsafe fn to_utf8_neon(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>,
                     && j + 1 < MIN_TO_UTF8_DIM_SIMD
                     && vmaxvq_u16(low_surrogate_masked) != 0
                 {
-                    if !(0xdc00..=0xdfff).contains(utf16[i + j]) {
+                    if !(0xdc00..=0xdfff).contains(&utf16[i + j]) {
                         return Err("Invalid UTF-16 string: wrong surrogate pair".to_string());
                     }
                     offset += utf16_surrogate_pair_to_utf8(utf16[i + j], offset, ptr);
@@ -264,10 +292,29 @@ unsafe fn to_utf8_neon(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>,
             }
         }
     }
-    Ok(Vec::new())
+    for i in range_end..utf16_len {
+        if i + 1 < utf16_len
+            && utf16[i] >= 0xD800u16
+            && utf16[i] <= 0xDBFFu16
+            && utf16[i + 1] >= 0xDC00u16
+            && utf16[i + 1] <= 0xDFFFu16
+        {
+            if !(0xdc00..=0xdfff).contains(&utf16[i]) {
+                return Err("Invalid UTF-16 string: wrong surrogate pair".to_string());
+            }
+            offset += utf16_surrogate_pair_to_utf8(utf16[i], offset, ptr);
+        } else {
+            offset += utf16_to_utf8(utf16[i], offset, ptr);
+        }
+    }
+    unsafe {
+        // As ptr.write don't change the length
+        utf8_bytes.set_len(offset);
+    }
+    Ok(utf8_bytes)
 }
 
-pub fn to_utf8(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, String> {
+pub fn to_utf8_std(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, String> {
     // Pre-allocating capacity to avoid dynamic resizing
     // Longest case: 1 u16 to 3 u8
     let mut utf8_bytes: Vec<u8> = Vec::with_capacity(utf16.len() * 3);
@@ -355,4 +402,44 @@ pub fn to_utf8(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, String>
         utf8_bytes.set_len(offset);
     }
     Ok(utf8_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use core::str;
+
+    // 导入外部模块中的内容
+    use super::*;
+
+    #[test]
+    fn test_to_utf8() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx") && is_x86_feature_detected!("fma") {
+                assert!(unsafe { is_latin_avx(&s) });
+                assert!(!unsafe { is_latin_avx(&not_latin_str) });
+            }
+        }
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if is_x86_feature_detected!("sse") && s.len() >= MIN_DIM_SIZE_SIMD {
+                assert!(unsafe { is_latin_sse(&s) });
+                assert!(!unsafe { is_latin_sse(&not_latin_str) });
+            }
+        }
+
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        {
+            if std::arch::is_aarch64_feature_detected!("neon") {
+                // basic logic
+                let str1: Vec<u16> = "Hello, 世界!".encode_utf16().collect();
+
+                let aa = unsafe { to_utf8_neon(&str1, true) };
+                println!("aa: {:?}", aa);
+                assert_eq!(str::from_utf8(&aa.unwrap()), Ok("Hello, 世界!"));
+            }
+        }
+        // assert!(to_utf8_std(&s));
+    }
 }
