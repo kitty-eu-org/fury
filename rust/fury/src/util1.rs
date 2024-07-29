@@ -64,10 +64,9 @@ fn utf16_to_utf8(code_point: u16, offset: usize, ptr: *mut u8) -> usize {
     }
 }
 
-fn utf16_surrogate_pair_to_utf8(code_point: u16, offset: usize, ptr: *mut u8) -> usize {
+fn utf16_surrogate_pair_to_utf8(high: u16, low: u16, offset: usize, ptr: *mut u8) -> usize {
     // utf16 to unicode
-    let code_point =
-        ((((code_point as u32) - 0xd800) << 10) | ((code_point as u32) - 0xdc00)) + 0x10000;
+    let code_point = ((((high as u32) - 0xd800) << 10) | ((low as u32) - 0xdc00)) + 0x10000;
     // 11110??? 10?????? 10?????? 10??????
     // Need 21 bit suffix of code_point
     let bytes = [
@@ -128,12 +127,13 @@ unsafe fn to_utf8_avx(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, 
             for j in 0..MIN_TO_UTF8_DIM_AVX {
                 if _mm256_testz_si256(high_surrogate_masked, high_surrogate_masked) == 1
                     && j + 1 < MIN_TO_UTF8_DIM_AVX
-                    && _mm256_testz_si256(low_surrogate_masked, low_surrogate_masked) == 1
+                    && _mm256_testz_si256(low_surrogate_masked, low_surrogate_masked) != 1
                 {
                     if !(0xdc00..=0xdfff).contains(&utf16[i + j]) {
                         return Err("Invalid UTF-16 string: wrong surrogate pair".to_string());
                     }
-                    offset += utf16_surrogate_pair_to_utf8(utf16[i + j], offset, ptr);
+                    offset +=
+                        utf16_surrogate_pair_to_utf8(utf16[i + j], utf16[i + j + 1], offset, ptr);
                 } else {
                     offset += utf16_to_utf8(utf16[i + j], offset, ptr);
                 }
@@ -141,18 +141,27 @@ unsafe fn to_utf8_avx(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, 
         }
     }
 
-    for i in range_end..utf16_len {
+    let mut i = range_end;
+    while i < utf16_len {
         if i + 1 < utf16_len
-            && utf16[i] >= 0xD800u16
-            && utf16[i] <= 0xDBFFu16
-            && utf16[i + 1] >= 0xDC00u16
-            && utf16[i + 1] <= 0xDFFFu16
+            && utf16[i] >= 0xD800
+            && utf16[i] <= 0xDBFF
+            && utf16[i + 1] >= 0xDC00
+            && utf16[i + 1] <= 0xDFFF
         {
-            if !(0xdc00..=0xdfff).contains(&utf16[i + 1]) {
+            if !(0xDC00..=0xDFFF).contains(&utf16[i + 1]) {
                 return Err("Invalid UTF-16 string: wrong surrogate pair".to_string());
             }
-            offset += utf16_surrogate_pair_to_utf8(utf16[i], offset, ptr);
+            offset += utf16_surrogate_pair_to_utf8(utf16[i], utf16[i + 1], offset, ptr);
+            i += 2; // 跳过下一个元素，因为它已经被作为代理对的一部分处理过了
+        } else {
+            offset += utf16_to_utf8(utf16[i], offset, ptr);
+            i += 1; // 继续到下一个元素
         }
+    }
+    unsafe {
+        // As ptr.write don't change the length
+        utf8_bytes.set_len(offset);
     }
     Ok(utf8_bytes)
 }
@@ -209,7 +218,8 @@ unsafe fn to_utf8_sse(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, 
                     if !(0xdc00..=0xdfff).contains(&utf16[i + j]) {
                         return Err("Invalid UTF-16 string: wrong surrogate pair".to_string());
                     }
-                    offset += utf16_surrogate_pair_to_utf8(utf16[i + j], offset, ptr);
+                    offset +=
+                        utf16_surrogate_pair_to_utf8(utf16[i + j], utf16[i + j + 1], offset, ptr);
                 } else {
                     offset += utf16_to_utf8(utf16[i + j], offset, ptr);
                 }
@@ -217,18 +227,27 @@ unsafe fn to_utf8_sse(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, 
         }
     }
 
-    for i in range_end..utf16_len {
+    let mut i = range_end;
+    while i < utf16_len {
         if i + 1 < utf16_len
-            && utf16[i] >= 0xD800u16
-            && utf16[i] <= 0xDBFFu16
-            && utf16[i + 1] >= 0xDC00u16
-            && utf16[i + 1] <= 0xDFFFu16
+            && utf16[i] >= 0xD800
+            && utf16[i] <= 0xDBFF
+            && utf16[i + 1] >= 0xDC00
+            && utf16[i + 1] <= 0xDFFF
         {
-            if !(0xdc00..=0xdfff).contains(&utf16[i + 1]) {
+            if !(0xDC00..=0xDFFF).contains(&utf16[i + 1]) {
                 return Err("Invalid UTF-16 string: wrong surrogate pair".to_string());
             }
-            offset += utf16_surrogate_pair_to_utf8(utf16[i], offset, ptr);
+            offset += utf16_surrogate_pair_to_utf8(utf16[i], utf16[i + 1], offset, ptr);
+            i += 2; // 跳过下一个元素，因为它已经被作为代理对的一部分处理过了
+        } else {
+            offset += utf16_to_utf8(utf16[i], offset, ptr);
+            i += 1; // 继续到下一个元素
         }
+    }
+    unsafe {
+        // As ptr.write don't change the length
+        utf8_bytes.set_len(offset);
     }
     Ok(utf8_bytes)
 }
@@ -264,7 +283,6 @@ unsafe fn to_utf8_neon(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>,
             vcltq_u16(chunk, surrogate_low_end),
         );
         let res = vmaxvq_u16(masked1);
-        println!("res: {}", res);
         if vmaxvq_u16(masked1) == 0 {
             for j in 0..MIN_TO_UTF8_DIM_SIMD {
                 unsafe {
@@ -285,26 +303,30 @@ unsafe fn to_utf8_neon(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>,
                     if !(0xdc00..=0xdfff).contains(&utf16[i + j]) {
                         return Err("Invalid UTF-16 string: wrong surrogate pair".to_string());
                     }
-                    offset += utf16_surrogate_pair_to_utf8(utf16[i + j], offset, ptr);
+                    offset +=
+                        utf16_surrogate_pair_to_utf8(utf16[i + j], utf16[i + j + 1], offset, ptr);
                 } else {
                     offset += utf16_to_utf8(utf16[i + j], offset, ptr);
                 }
             }
         }
     }
-    for i in range_end..utf16_len {
+    let mut i = range_end;
+    while i < utf16_len {
         if i + 1 < utf16_len
-            && utf16[i] >= 0xD800u16
-            && utf16[i] <= 0xDBFFu16
-            && utf16[i + 1] >= 0xDC00u16
-            && utf16[i + 1] <= 0xDFFFu16
+            && utf16[i] >= 0xD800
+            && utf16[i] <= 0xDBFF
+            && utf16[i + 1] >= 0xDC00
+            && utf16[i + 1] <= 0xDFFF
         {
-            if !(0xdc00..=0xdfff).contains(&utf16[i]) {
+            if !(0xDC00..=0xDFFF).contains(&utf16[i + 1]) {
                 return Err("Invalid UTF-16 string: wrong surrogate pair".to_string());
             }
-            offset += utf16_surrogate_pair_to_utf8(utf16[i], offset, ptr);
+            offset += utf16_surrogate_pair_to_utf8(utf16[i], utf16[i + 1], offset, ptr);
+            i += 2; // 跳过下一个元素，因为它已经被作为代理对的一部分处理过了
         } else {
             offset += utf16_to_utf8(utf16[i], offset, ptr);
+            i += 1; // 继续到下一个元素
         }
     }
     unsafe {
@@ -314,7 +336,7 @@ unsafe fn to_utf8_neon(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>,
     Ok(utf8_bytes)
 }
 
-pub fn to_utf8_std(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, String> {
+fn to_utf8_std(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, String> {
     // Pre-allocating capacity to avoid dynamic resizing
     // Longest case: 1 u16 to 3 u8
     let mut utf8_bytes: Vec<u8> = Vec::with_capacity(utf16.len() * 3);
@@ -324,7 +346,7 @@ pub fn to_utf8_std(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, Str
     let mut iter = utf16.iter();
     while let Some(&wc) = iter.next() {
         // Using big endian in this conversion
-        let wc = if is_little_endian {
+        let wc = if !is_little_endian {
             swap_endian(wc)
         } else {
             wc
@@ -354,7 +376,7 @@ pub fn to_utf8_std(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, Str
                 // Surrogate pair (4-byte UTF-8)
                 // Need extra u16, 2 u16 -> 4 u8
                 if let Some(&wc2) = iter.next() {
-                    let wc2 = if is_little_endian {
+                    let wc2 = if !is_little_endian {
                         swap_endian(wc2)
                     } else {
                         wc2
@@ -408,38 +430,137 @@ pub fn to_utf8_std(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, Str
 mod tests {
     use core::str;
 
-    // 导入外部模块中的内容
     use super::*;
 
     #[test]
     fn test_to_utf8() {
+        let basic_str: Vec<u16> = "Hello, 世界!".encode_utf16().collect();
+        let empty_str = Vec::<u16>::new();
+        let expected_empty_str = "".as_bytes().to_vec();
+        let emoji_str = vec![0xD83Du16, 0xDE00u16]; // 😀 emoji
+        let expected_emoji_str = b"\xF0\x9F\x98\x80".to_vec();
+        let boundary_str = vec![0x0000u16, 0xFFFFu16];
+        let expected_boundary_str = b"\x00\xEF\xBF\xBF".to_vec();
+        let new_line_str: Vec<u16> = " \n\t".encode_utf16().collect();
+        let expected_new_line_str: Vec<u8> = b" \n\t".to_vec();
+        let small_end_str = vec![0x61u16, 0x62u16]; // "ab"
+        let expected_small_end_str = b"ab".to_vec();
+        let big_end_str = vec![0xFFFEu16, 0xFFFEu16];
+        let expected_big_end_str = b"\xEF\xBF\xBE\xEF\xBF\xBE".to_vec();
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx") && is_x86_feature_detected!("fma") {
-                assert!(unsafe { is_latin_avx(&s) });
-                assert!(!unsafe { is_latin_avx(&not_latin_str) });
+                assert_eq!(
+                    str::from_utf8(&(unsafe { to_utf8_avx(&basic_str, true) }).unwrap()),
+                    Ok("Hello, 世界!")
+                );
+                assert_eq!(
+                    unsafe { to_utf8_avx(&empty_str, true) },
+                    Ok(expected_empty_str.clone())
+                );
+                assert_eq!(
+                    unsafe { to_utf8_avx(&emoji_str, true) },
+                    Ok(expected_emoji_str.clone())
+                );
+                assert_eq!(
+                    unsafe { to_utf8_avx(&boundary_str, true) },
+                    Ok(expected_boundary_str.clone())
+                );
+                assert_eq!(
+                    unsafe { to_utf8_avx(&new_line_str, true) },
+                    Ok(expected_new_line_str.clone())
+                );
+                assert_eq!(
+                    unsafe { to_utf8_avx(&small_end_str, true) },
+                    Ok(expected_small_end_str.clone())
+                );
+                assert_eq!(
+                    unsafe { to_utf8_avx(&big_end_str, true) },
+                    Ok(expected_big_end_str.clone())
+                );
             }
         }
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
-            if is_x86_feature_detected!("sse") && s.len() >= MIN_DIM_SIZE_SIMD {
-                assert!(unsafe { is_latin_sse(&s) });
-                assert!(!unsafe { is_latin_sse(&not_latin_str) });
+            if is_x86_feature_detected!("sse") {
+                assert_eq!(
+                    str::from_utf8(&(unsafe { to_utf8_avx(&basic_str, true) }).unwrap()),
+                    Ok("Hello, 世界!")
+                );
+                assert_eq!(
+                    unsafe { to_utf8_avx(&empty_str, true) },
+                    Ok(expected_empty_str.clone())
+                );
+                assert_eq!(
+                    unsafe { to_utf8_avx(&emoji_str, true) },
+                    Ok(expected_emoji_str.clone())
+                );
+                assert_eq!(
+                    unsafe { to_utf8_avx(&boundary_str, true) },
+                    Ok(expected_boundary_str.clone())
+                );
+                assert_eq!(
+                    unsafe { to_utf8_avx(&new_line_str, true) },
+                    Ok(expected_new_line_str.clone())
+                );
+                assert_eq!(
+                    unsafe { to_utf8_avx(&small_end_str, true) },
+                    Ok(expected_small_end_str.clone())
+                );
+                assert_eq!(
+                    unsafe { to_utf8_avx(&big_end_str, true) },
+                    Ok(expected_big_end_str.clone())
+                );
             }
         }
 
         #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
         {
             if std::arch::is_aarch64_feature_detected!("neon") {
-                // basic logic
-                let str1: Vec<u16> = "Hello, 世界!".encode_utf16().collect();
-
-                let aa = unsafe { to_utf8_neon(&str1, true) };
-                println!("aa: {:?}", aa);
-                assert_eq!(str::from_utf8(&aa.unwrap()), Ok("Hello, 世界!"));
+                assert_eq!(
+                    str::from_utf8(&(unsafe { to_utf8_neon(&basic_str, true) }).unwrap()),
+                    Ok("Hello, 世界!")
+                );
+                assert_eq!(
+                    unsafe { to_utf8_avx(&empty_str, true) },
+                    Ok(expected_empty_str)
+                );
+                assert_eq!(
+                    unsafe { to_utf8_avx(&emoji_str, true) },
+                    Ok(expected_emoji_str)
+                );
+                assert_eq!(
+                    unsafe { to_utf8_avx(&boundary_str, true) },
+                    Ok(expected_boundary_str)
+                );
+                assert_eq!(
+                    unsafe { to_utf8_avx(&new_line_str, true) },
+                    Ok(expected_new_line_str)
+                );
+                assert_eq!(
+                    unsafe { to_utf8_avx(&small_end_str, true) },
+                    Ok(expected_small_end_str)
+                );
+                assert_eq!(
+                    unsafe { to_utf8_avx(&big_end_str, true) },
+                    Ok(expected_big_end_str)
+                );
             }
         }
-        // assert!(to_utf8_std(&s));
+
+        assert_eq!(
+            str::from_utf8(&(to_utf8_std(&basic_str, true).unwrap())),
+            Ok("Hello, 世界!")
+        );
+        assert_eq!(to_utf8_std(&empty_str, true), Ok(expected_empty_str));
+        assert_eq!(to_utf8_std(&emoji_str, true), Ok(expected_emoji_str));
+        assert_eq!(to_utf8_std(&boundary_str, true), Ok(expected_boundary_str));
+        assert_eq!(to_utf8_std(&new_line_str, true), Ok(expected_new_line_str));
+        assert_eq!(
+            to_utf8_std(&small_end_str, true),
+            Ok(expected_small_end_str)
+        );
+        assert_eq!(to_utf8_std(&big_end_str, true), Ok(expected_big_end_str));
     }
 }
