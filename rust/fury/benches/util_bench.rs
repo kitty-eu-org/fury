@@ -17,6 +17,9 @@
 
 use std::ptr;
 
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use rand::Rng;
+
 #[cfg(target_feature = "neon")]
 use std::arch::aarch64::*;
 
@@ -82,7 +85,7 @@ fn utf16_surrogate_pair_to_utf8(high: u16, low: u16, offset: usize, ptr: *mut u8
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn to_utf8_avx(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, String> {
+pub unsafe fn to_utf8_avx(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, String> {
     let utf16_len = utf16.len();
     let mut offset = 0;
     let mut utf8_bytes: Vec<u8> = Vec::with_capacity(utf16_len * 3);
@@ -153,10 +156,10 @@ unsafe fn to_utf8_avx(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, 
                 return Err("Invalid UTF-16 string: wrong surrogate pair".to_string());
             }
             offset += utf16_surrogate_pair_to_utf8(utf16[i], utf16[i + 1], offset, ptr);
-            i += 2; // 跳过下一个元素，因为它已经被作为代理对的一部分处理过了
+            i += 2;
         } else {
             offset += utf16_to_utf8(utf16[i], offset, ptr);
-            i += 1; // 继续到下一个元素
+            i += 1;
         }
     }
     unsafe {
@@ -167,7 +170,7 @@ unsafe fn to_utf8_avx(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, 
 }
 
 #[cfg(target_feature = "sse2")]
-unsafe fn to_utf8_sse(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, String> {
+pub unsafe fn to_utf8_sse(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, String> {
     let utf16_len = utf16.len();
     let mut offset = 0;
     let mut utf8_bytes: Vec<u8> = Vec::with_capacity(utf16_len * 3);
@@ -175,8 +178,6 @@ unsafe fn to_utf8_sse(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, 
     let limit1 = _mm_set1_epi16(0x80);
     let limit2 = _mm_set1_epi16(0x800);
     let surrogate_high_start = _mm_set1_epi16(0xD800u16 as i16);
-    let surrogate_high_end = _mm_set1_epi16(0xDBFFu16 as i16);
-    let surrogate_low_start = _mm_set1_epi16(0xDC00u16 as i16);
     let surrogate_low_end = _mm_set1_epi16(0xDFFFu16 as i16);
 
     let remaining = utf16_len % MIN_TO_UTF8_DIM_SIMD;
@@ -187,37 +188,41 @@ unsafe fn to_utf8_sse(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, 
             chunk = _mm_or_si128(_mm_slli_epi16(chunk, 8), _mm_slli_epi16(chunk, 8));
             // Swap bytes for big-endian
         }
-        let masked1 = _mm_cmpgt_epi16(chunk, limit1);
-        let masked2 = _mm_cmpgt_epi16(chunk, limit2);
-        let high_surrogate_masked = _mm_and_si128(
+        let masked1 = _mm_cmplt_epi16(chunk, limit1);
+        let masked2 = _mm_andnot_si128(masked1, _mm_cmplt_epi16(chunk, limit2));
+        let is_surrogate = _mm_and_si128(
             _mm_cmpgt_epi16(chunk, surrogate_high_start),
-            _mm_cmpgt_epi16(chunk, surrogate_high_end),
+            _mm_cmplt_epi16(chunk, surrogate_low_end),
         );
-        let low_surrogate_masked = _mm_and_si128(
-            _mm_cmpgt_epi16(chunk, surrogate_low_start),
-            _mm_cmpgt_epi16(chunk, surrogate_low_end),
-        );
-        if _mm_testz_si128(masked1, masked1) == 1 {
-            for j in 0..MIN_TO_UTF8_DIM_SIMD {
-                unsafe {
-                    ptr.add(offset).write(utf16[i + j] as u8);
-                }
-                offset += 1;
+
+        if _mm_test_all_zeros(masked1, masked1) == 1 {
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    utf16[i..i + MIN_TO_UTF8_DIM_SIMD].as_ptr() as *const u8,
+                    ptr.add(offset),
+                    MIN_TO_UTF8_DIM_SIMD,
+                );
             }
-        } else if _mm_testz_si128(masked2, masked2) == 1 {
+            offset += MIN_TO_UTF8_DIM_SIMD;
+        } else if _mm_test_all_zeros(masked2, masked2) == 1 {
             for j in 0..MIN_TO_UTF8_DIM_SIMD {
-                offset += utf16_to_utf8(utf16[i + j], offset, ptr)
+                let bytes = [
+                    (utf16[i + j] >> 6 & 0b1_1111) as u8 | 0b1100_0000,
+                    (utf16[i + j] & 0b11_1111) as u8 | 0b1000_0000,
+                ];
+                ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    ptr.add(offset),
+                    2,
+                );
+                offset += 2
             }
         } else {
             for j in 0..MIN_TO_UTF8_DIM_SIMD {
-                if _mm_testz_si128(high_surrogate_masked, high_surrogate_masked) == 1  // surrogate_high_start < chunk < surrogate_high_end
+                if _mm_test_all_zeros(is_surrogate, is_surrogate) == 1
                     && j + 1 < MIN_TO_UTF8_DIM_SIMD
-                    && _mm_testz_si128(low_surrogate_masked, low_surrogate_masked) == 0
-                // not surrogate_low_start < chunk < surrogate_low_end
+                    && (0xdc00..=0xdfff).contains(&utf16[i + j + 1])
                 {
-                    if !(0xdc00..=0xdfff).contains(&utf16[i + j]) {
-                        return Err("Invalid UTF-16 string: wrong surrogate pair".to_string());
-                    }
                     offset +=
                         utf16_surrogate_pair_to_utf8(utf16[i + j], utf16[i + j + 1], offset, ptr);
                 } else {
@@ -239,10 +244,10 @@ unsafe fn to_utf8_sse(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, 
                 return Err("Invalid UTF-16 string: wrong surrogate pair".to_string());
             }
             offset += utf16_surrogate_pair_to_utf8(utf16[i], utf16[i + 1], offset, ptr);
-            i += 2; // 跳过下一个元素，因为它已经被作为代理对的一部分处理过了
+            i += 2;
         } else {
             offset += utf16_to_utf8(utf16[i], offset, ptr);
-            i += 1; // 继续到下一个元素
+            i += 1;
         }
     }
     unsafe {
@@ -253,7 +258,7 @@ unsafe fn to_utf8_sse(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, 
 }
 
 #[cfg(target_feature = "neon")]
-unsafe fn to_utf8_neon(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, String> {
+pub unsafe fn to_utf8_neon(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, String> {
     let utf16_len = utf16.len();
     let mut offset = 0;
     let mut utf8_bytes: Vec<u8> = Vec::with_capacity(utf16_len * 3);
@@ -323,10 +328,10 @@ unsafe fn to_utf8_neon(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>,
                 return Err("Invalid UTF-16 string: wrong surrogate pair".to_string());
             }
             offset += utf16_surrogate_pair_to_utf8(utf16[i], utf16[i + 1], offset, ptr);
-            i += 2; // 跳过下一个元素，因为它已经被作为代理对的一部分处理过了
+            i += 2;
         } else {
             offset += utf16_to_utf8(utf16[i], offset, ptr);
-            i += 1; // 继续到下一个元素
+            i += 1;
         }
     }
     unsafe {
@@ -336,7 +341,7 @@ unsafe fn to_utf8_neon(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>,
     Ok(utf8_bytes)
 }
 
-fn to_utf8_std(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, String> {
+pub fn to_utf8_std(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, String> {
     // Pre-allocating capacity to avoid dynamic resizing
     // Longest case: 1 u16 to 3 u8
     let mut utf8_bytes: Vec<u8> = Vec::with_capacity(utf16.len() * 3);
@@ -426,141 +431,77 @@ fn to_utf8_std(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, String>
     Ok(utf8_bytes)
 }
 
-#[cfg(test)]
-mod tests {
-    use core::str;
-
-    use super::*;
-
-    #[test]
-    fn test_to_utf8() {
-        let basic_str: Vec<u16> = "Hello, 世界!".encode_utf16().collect();
-        let empty_str = Vec::<u16>::new();
-        let expected_empty_str = "".as_bytes().to_vec();
-        let emoji_str = vec![0xD83Du16, 0xDE00u16]; // 😀 emoji
-        let expected_emoji_str = b"\xF0\x9F\x98\x80".to_vec();
-        let boundary_str = vec![0x0000u16, 0xFFFFu16];
-        let expected_boundary_str = b"\x00\xEF\xBF\xBF".to_vec();
-        let new_line_str: Vec<u16> = " \n\t".encode_utf16().collect();
-        let expected_new_line_str: Vec<u8> = b" \n\t".to_vec();
-        let small_end_str = vec![0x61u16, 0x62u16]; // "ab"
-        let expected_small_end_str = b"ab".to_vec();
-        let big_end_str = vec![0xFFFEu16, 0xFFFEu16];
-        let expected_big_end_str = b"\xEF\xBF\xBE\xEF\xBF\xBE".to_vec();
-        #[cfg(target_arch = "x86_64")]
+pub fn to_utf8(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, String> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx")
+            && is_x86_feature_detected!("fma")
+            && utf16.len() >= MIN_TO_UTF8_DIM_AVX
         {
-            if is_x86_feature_detected!("avx") && is_x86_feature_detected!("fma") {
-                assert_eq!(
-                    str::from_utf8(&(unsafe { to_utf8_avx(&basic_str, true) }).unwrap()),
-                    Ok("Hello, 世界!")
-                );
-                assert_eq!(
-                    unsafe { to_utf8_avx(&empty_str, true) },
-                    Ok(expected_empty_str.clone())
-                );
-                assert_eq!(
-                    unsafe { to_utf8_avx(&emoji_str, true) },
-                    Ok(expected_emoji_str.clone())
-                );
-                assert_eq!(
-                    unsafe { to_utf8_avx(&boundary_str, true) },
-                    Ok(expected_boundary_str.clone())
-                );
-                assert_eq!(
-                    unsafe { to_utf8_avx(&new_line_str, true) },
-                    Ok(expected_new_line_str.clone())
-                );
-                assert_eq!(
-                    unsafe { to_utf8_avx(&small_end_str, true) },
-                    Ok(expected_small_end_str.clone())
-                );
-                assert_eq!(
-                    unsafe { to_utf8_avx(&big_end_str, true) },
-                    Ok(expected_big_end_str.clone())
-                );
-            }
+            return unsafe { to_utf8_avx(utf16, is_little_endian) };
         }
-
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            if is_x86_feature_detected!("sse") {
-                assert_eq!(
-                    str::from_utf8(&(unsafe { to_utf8_avx(&basic_str, true) }).unwrap()),
-                    Ok("Hello, 世界!")
-                );
-                assert_eq!(
-                    unsafe { to_utf8_avx(&empty_str, true) },
-                    Ok(expected_empty_str.clone())
-                );
-                assert_eq!(
-                    unsafe { to_utf8_avx(&emoji_str, true) },
-                    Ok(expected_emoji_str.clone())
-                );
-                assert_eq!(
-                    unsafe { to_utf8_avx(&boundary_str, true) },
-                    Ok(expected_boundary_str.clone())
-                );
-                assert_eq!(
-                    unsafe { to_utf8_avx(&new_line_str, true) },
-                    Ok(expected_new_line_str.clone())
-                );
-                assert_eq!(
-                    unsafe { to_utf8_avx(&small_end_str, true) },
-                    Ok(expected_small_end_str.clone())
-                );
-                assert_eq!(
-                    unsafe { to_utf8_avx(&big_end_str, true) },
-                    Ok(expected_big_end_str.clone())
-                );
-            }
-        }
-
-        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-        {
-            if std::arch::is_aarch64_feature_detected!("neon") {
-                assert_eq!(
-                    str::from_utf8(&(unsafe { to_utf8_neon(&basic_str, true) }).unwrap()),
-                    Ok("Hello, 世界!")
-                );
-                assert_eq!(
-                    unsafe { to_utf8_avx(&empty_str, true) },
-                    Ok(expected_empty_str)
-                );
-                assert_eq!(
-                    unsafe { to_utf8_avx(&emoji_str, true) },
-                    Ok(expected_emoji_str)
-                );
-                assert_eq!(
-                    unsafe { to_utf8_avx(&boundary_str, true) },
-                    Ok(expected_boundary_str)
-                );
-                assert_eq!(
-                    unsafe { to_utf8_avx(&new_line_str, true) },
-                    Ok(expected_new_line_str)
-                );
-                assert_eq!(
-                    unsafe { to_utf8_avx(&small_end_str, true) },
-                    Ok(expected_small_end_str)
-                );
-                assert_eq!(
-                    unsafe { to_utf8_avx(&big_end_str, true) },
-                    Ok(expected_big_end_str)
-                );
-            }
-        }
-
-        assert_eq!(
-            str::from_utf8(&(to_utf8_std(&basic_str, true).unwrap())),
-            Ok("Hello, 世界!")
-        );
-        assert_eq!(to_utf8_std(&empty_str, true), Ok(expected_empty_str));
-        assert_eq!(to_utf8_std(&emoji_str, true), Ok(expected_emoji_str));
-        assert_eq!(to_utf8_std(&boundary_str, true), Ok(expected_boundary_str));
-        assert_eq!(to_utf8_std(&new_line_str, true), Ok(expected_new_line_str));
-        assert_eq!(
-            to_utf8_std(&small_end_str, true),
-            Ok(expected_small_end_str)
-        );
-        assert_eq!(to_utf8_std(&big_end_str, true), Ok(expected_big_end_str));
     }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("sse") && utf16.len() >= MIN_TO_UTF8_DIM_SIMD {
+            return unsafe { to_utf8_sse(utf16, is_little_endian) };
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") && utf16.len() >= MIN_TO_UTF8_DIM_SIMD {
+            return unsafe { to_utf8_neon(utf16, is_little_endian) };
+        }
+    }
+    to_utf8_std(utf16, is_little_endian)
 }
+
+fn generate_random_utf16_string(length: usize) -> Vec<u16> {
+    let mut rng = rand::thread_rng();
+    (0..length).map(|_| rng.gen_range(0x0000..0xD7FF)).collect()
+}
+
+fn criterion_benchmark(c: &mut Criterion) {
+    let test_str_short = generate_random_utf16_string(100).repeat(1000);
+    let test_str_long = generate_random_utf16_string(1000).repeat(1000);
+
+    #[cfg(target_feature = "sse2")]
+    c.bench_function("SIMD sse short", |b| {
+        b.iter(|| unsafe { to_utf8_sse(black_box(&test_str_short), true) })
+    });
+    #[cfg(target_feature = "sse2")]
+    c.bench_function("SIMD sse long", |b| {
+        b.iter(|| unsafe { to_utf8_sse(black_box(&test_str_long), true) })
+    });
+
+    #[cfg(target_feature = "avx2")]
+    c.bench_function("SIMD avx short", |b| {
+        b.iter(|| unsafe { to_utf8_avx(black_box(&test_str_short), true) })
+    });
+    #[cfg(target_feature = "avx2")]
+    c.bench_function("SIMD avx long", |b| {
+        b.iter(|| unsafe { to_utf8_avx(black_box(&test_str_long), true) })
+    });
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    c.bench_function("SIMD neon short", |b| {
+        b.iter(|| unsafe { to_utf8_neon(black_box(&test_str_short), true) })
+    });
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    c.bench_function("SIMD neon long", |b| {
+        b.iter(|| unsafe { to_utf8_neon(black_box(&test_str_long), true) })
+    });
+
+    c.bench_function("Standard short", |b| {
+        b.iter(|| to_utf8_std(black_box(&test_str_short), true))
+    });
+
+    c.bench_function("Standard long", |b| {
+        b.iter(|| to_utf8_std(black_box(&test_str_long), true))
+    });
+}
+
+criterion_group!(benches, criterion_benchmark);
+criterion_main!(benches);

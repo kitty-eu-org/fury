@@ -23,7 +23,6 @@ mod row;
 mod serializer;
 mod types;
 mod util;
-mod util1;
 
 pub use deserializer::from_buffer;
 pub use error::Error;
@@ -40,4 +39,16 @@ pub mod __derive {
     pub use crate::serializer::{Serialize, SerializerState};
     pub use crate::types::{compute_struct_hash, FieldType, FuryMeta, SIZE_OF_REF_AND_TYPE};
     pub use crate::Error;
+}
+
+#[cfg(test)]
+pub mod fury_bench {
+    #[cfg(target_feature = "avx2")]
+    pub use crate::util::to_utf8_avx;
+    #[cfg(target_feature = "neon")]
+    pub use crate::util::to_utf8_neon;
+    #[cfg(target_feature = "sse2")]
+    pub use crate::util::to_utf8_sse;
+
+    pub use crate::util::to_utf8_std;
 }
