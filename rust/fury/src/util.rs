@@ -1720,15 +1720,6 @@ pub unsafe fn to_utf8_sse(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u
     let ptr = utf8_bytes.as_mut_ptr();
     let limit1 = _mm_set1_epi16(0x80);
     let limit2 = _mm_set1_epi16(0x800);
-    let surrogate_high_start = _mm_set1_epi16(0xD800u16 as i16);
-    let surrogate_low_end = _mm_set1_epi16(0xDFFFu16 as i16);
-    let dup_even = _mm_setr_epi16(
-        0x0000, 0x0202, 0x0404, 0x0606, 0x0808, 0x0a0a, 0x0c0c, 0x0e0e,
-    );
-
-    let v_0x1f = _mm_set1_epi16(0x1F00);
-    let v_003f = _mm_set1_epi16(0x003F);
-    let v_c080 = _mm_set1_epi16(0xC080u16 as i16);
     let one_mask = _mm_setr_epi16(
         0x0001, 0x0004, 0x0010, 0x0040, 0x0100, 0x0400, 0x1000, 0x4000,
     );
@@ -1756,49 +1747,43 @@ pub unsafe fn to_utf8_sse(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u
             // Swap bytes for big-endian
         }
         let masked1 = _mm_cmplt_epi16(chunk, limit1);
-        let masked2 = _mm_and_si128(masked1, _mm_cmplt_epi16(chunk, limit2));
+        let masked2 = _mm_andnot_si128(masked1, _mm_cmplt_epi16(chunk, limit2));
 
-        if _mm_test_all_zeros(masked1, masked1) == 1 {
+        if _mm_test_all_ones(masked1) == 1 {
             _mm_storeu_si128(
                 ptr.add(offset) as *mut __m128i,
                 _mm_packus_epi16(*&chunk, *&chunk),
             );
             offset += MIN_TO_UTF8_DIM_SIMD;
         } else if _mm_test_all_ones(masked2) == 1 {
-            let one_byte_bytemask = _mm_cmplt_epi16(chunk, limit1);
-            let t0 = _mm_slli_epi16(chunk, 2);
-            let t1 = _mm_and_si128(t0, v_0x1f);
-            let t2 = _mm_and_si128(t1, v_003f);
+            let high_bits = _mm_and_si128(_mm_srli_epi16(chunk, 6), _mm_set1_epi16(0b1_1111));
+            let high_bits = _mm_packus_epi16(high_bits, _mm_setzero_si128());
+            let low_bits = _mm_and_si128(chunk, _mm_set1_epi16(0b11_1111));
+            let low_bits = _mm_packus_epi16(low_bits, _mm_setzero_si128());
+            let low_bits_arr: [u8; 16] = std::mem::transmute(low_bits);
+            println!("low_bits: {:?}", low_bits_arr);
 
-            let t3 = _mm_or_si128(t1, t2);
+            // let low_bits = _mm_unpacklo_epi64(low_bits, _mm_setzero_si128());
 
-            let t4 = _mm_or_si128(t3, v_c080);
+            let high_bytes = _mm_or_si128(high_bits, _mm_set1_epi8(0b1100_0000u8 as i8));
+            let low_bytes = _mm_or_si128(low_bits, _mm_set1_epi8(0b1000_0000u8 as i8));
+            let low_bytes_arr: [u8; 16] = std::mem::transmute(low_bytes);
+            println!("Result: {:?}", low_bytes_arr);
+            let high_bytes_arr: [u8; 16] = std::mem::transmute(high_bytes);
+            println!("Result1: {:?}", high_bytes_arr);
 
-            let utf8_unpacked = _mm_blendv_epi8(t4, chunk, one_byte_bytemask);
-            let mask = _mm_setr_epi16(
-                0x0001, 0x0004, 0x0010, 0x0040, 0x0002, 0x0008, 0x0020, 0x0080,
-            );
-            let aa = _mm_and_si128(one_byte_bytemask, mask);
-            let sum1 = _mm_add_epi16(aa, _mm_srli_si128(aa, 8));
-            let sum2 = _mm_add_epi16(sum1, _mm_srli_si128(sum1, 4));
-            let sum3 = _mm_add_epi16(sum2, _mm_srli_si128(sum2, 2));
-
-            let m2 = _mm_extract_epi16(sum3, 0) as usize;
-            let row = PACK_1_2_UTF8_BYTES[m2].as_ptr();
-            let len = *row;
-            let shuffle_mask = _mm_loadu_si128(row.add(1) as *const __m128i);
-            let utf8_packed = _mm_shuffle_epi8(utf8_unpacked, shuffle_mask);
-            _mm_storeu_si128(ptr.add(offset) as *mut __m128i, utf8_packed);
-            offset += len as usize;
-            unsafe {
-                utf8_bytes.set_len(offset);
-            }
+            let zip = _mm_unpacklo_epi8(high_bytes, low_bytes); // interleave
+            let zip_arr: [u8; 16] = std::mem::transmute(zip);
+            println!("zip: {:?}", zip_arr);
+            _mm_storeu_si128(ptr.add(offset) as *mut __m128i, zip);
+            offset += MIN_TO_UTF8_DIM_SIMD * 2;
         } else {
             let shuffle_mask = _mm_set_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
             let t0 = _mm_shuffle_epi8(chunk, shuffle_mask);
             let t1 = _mm_and_si128(t0, _mm_set1_epi16(0b0011111101111111));
             let t2 = _mm_or_si128(t1, _mm_set1_epi16(0b1000000000000000u16 as i16));
             let s0 = _mm_srli_epi16(chunk, 12);
+
             let s1 = _mm_and_si128(chunk, _mm_set1_epi16(0b0000111111000000));
             let s1s = _mm_slli_epi16(s1, 2);
             let s2 = _mm_or_si128(s0, s1s);
@@ -1812,8 +1797,10 @@ pub unsafe fn to_utf8_sse(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u
             );
             let s4 = _mm_xor_si128(s3, m0);
 
-            let out0 = _mm_unpacklo_epi16(t2, s4);
-            let out1 = _mm_unpackhi_epi16(t2, s4);
+            let out0 = _mm_unpacklo_epi8(t2, s4);
+            // let out0 = _mm_unpacklo_epi16(t2, s4);
+            let out1 = _mm_unpacklo_epi8(t2, s4);
+            // let out1 = _mm_unpacklo_epi16(t2, s4);
 
             let v_007f = _mm_set1_epi16(0x007F as i16);
 
@@ -2061,6 +2048,26 @@ pub fn to_utf8_std(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, Str
             code_point if code_point < 0x800 => {
                 // 2-byte UTF-8
                 // [0000|0bbb|bbcc|cccc] => [110|bbbbb], [10|cccccc]
+                println!("code_point >> 6: {:?}", code_point >> 6);
+                println!(
+                    "(code_point >> 6 & 0b1_1111) as u8: {:?}",
+                    (code_point >> 6 & 0b1_1111) as u8
+                );
+                println!(
+                    "(code_point >> 6 & 0b1_1111) as u8 | 0b1100_0000: {:?}",
+                    (code_point >> 6 & 0b1_1111) as u8 | 0b1100_0000
+                );
+                println!("***********");
+                println!("code_point & 0b11_1111: {:?}", (code_point & 0b11_1111));
+                println!(
+                    "(code_point & 0b11_1111) as u8: {:?}",
+                    (code_point & 0b11_1111) as u8
+                );
+                println!(
+                    "(code_point & 0b11_1111) as u8 | 0b1000_0000: {:?}",
+                    (code_point & 0b11_1111) as u8 | 0b1000_0000
+                );
+                println!("xxxxxxxxx");
                 let bytes = [
                     (code_point >> 6 & 0b1_1111) as u8 | 0b1100_0000,
                     (code_point & 0b11_1111) as u8 | 0b1000_0000,
@@ -2213,30 +2220,54 @@ mod tests {
                     str::from_utf8(&(unsafe { to_utf8_sse(&basic_str, true) }).unwrap()),
                     Ok("Hello, 世界!")
                 );
-                // assert_eq!(
-                //     unsafe { to_utf8_sse(&empty_str, true) },
-                //     Ok(expected_empty_str.clone())
-                // );
-                // assert_eq!(
-                //     unsafe { to_utf8_sse(&emoji_str, true) },
-                //     Ok(expected_emoji_str.clone())
-                // );
-                // assert_eq!(
-                //     unsafe { to_utf8_sse(&boundary_str, true) },
-                //     Ok(expected_boundary_str.clone())
-                // );
-                // assert_eq!(
-                //     unsafe { to_utf8_sse(&new_line_str, true) },
-                //     Ok(expected_new_line_str.clone())
-                // );
-                // assert_eq!(
-                //     unsafe { to_utf8_sse(&small_end_str, true) },
-                //     Ok(expected_small_end_str.clone())
-                // );
-                // assert_eq!(
-                //     unsafe { to_utf8_sse(&big_end_str, true) },
-                //     Ok(expected_big_end_str.clone())
-                // );
+                assert_eq!(
+                    unsafe { to_utf8_sse(&empty_str, true) },
+                    Ok(expected_empty_str.clone())
+                );
+                assert_eq!(
+                    unsafe { to_utf8_sse(&emoji_str, true) },
+                    Ok(expected_emoji_str.clone())
+                );
+                assert_eq!(
+                    unsafe { to_utf8_sse(&boundary_str, true) },
+                    Ok(expected_boundary_str.clone())
+                );
+                assert_eq!(
+                    unsafe { to_utf8_sse(&new_line_str, true) },
+                    Ok(expected_new_line_str.clone())
+                );
+                assert_eq!(
+                    unsafe { to_utf8_sse(&small_end_str, true) },
+                    Ok(expected_small_end_str.clone())
+                );
+                assert_eq!(
+                    unsafe { to_utf8_sse(&big_end_str, true) },
+                    Ok(expected_big_end_str.clone())
+                );
+                let code_points = vec![
+                    0x100, // U+0100
+                    0x200, // U+0200
+                    0x300, // U+0300
+                    0x400, // U+0400
+                    0x400, // U+0400
+                    0x400, // U+0400
+                    0x400, // U+0400
+                    0x400, // U+0400
+                    0x500, // U+0500
+                    0x600, // U+0600
+                    0x700, // U+0700
+                    0x7FF, // U+07FF
+                ]
+                .to_vec();
+                let target = [
+                    196, 128, 200, 128, 204, 128, 208, 128, 208, 128, 208, 128, 208, 128, 208, 128,
+                    212, 128, 216, 128, 220, 128, 223, 191,
+                ];
+
+                assert_eq!(
+                    unsafe { to_utf8_sse(&code_points, true) },
+                    Ok(target.to_vec())
+                );
             }
         }
 
@@ -2299,18 +2330,43 @@ mod tests {
             }
         }
 
+        // assert_eq!(
+        //     str::from_utf8(&(to_utf8_std(&basic_str, true).unwrap())),
+        //     Ok("Hello, 世界!")
+        // );
+        // assert_eq!(to_utf8_std(&empty_str, true), Ok(expected_empty_str));
+        // assert_eq!(to_utf8_std(&emoji_str, true), Ok(expected_emoji_str));
+        // assert_eq!(to_utf8_std(&boundary_str, true), Ok(expected_boundary_str));
+        // assert_eq!(to_utf8_std(&new_line_str, true), Ok(expected_new_line_str));
+        // assert_eq!(
+        //     to_utf8_std(&small_end_str, true),
+        //     Ok(expected_small_end_str)
+        // );
+        // assert_eq!(to_utf8_std(&big_end_str, true), Ok(expected_big_end_str));
+
+        let code_points = vec![
+            0x100, // U+0100
+            0x200, // U+0200
+            0x300, // U+0300
+            0x400, // U+0400
+            0x400, // U+0400
+            0x400, // U+0400
+            0x400, // U+0400
+            0x400, // U+0400
+            0x500, // U+0500
+            0x600, // U+0600
+            0x700, // U+0700
+            0x7FF, // U+07FF
+        ]
+        .to_vec();
+        let target = [
+            196, 128, 200, 128, 204, 128, 208, 128, 208, 128, 208, 128, 208, 128, 208, 128, 212,
+            128, 216, 128, 220, 128, 223, 191,
+        ];
+
         assert_eq!(
-            str::from_utf8(&(to_utf8_std(&basic_str, true).unwrap())),
-            Ok("Hello, 世界!")
+            unsafe { to_utf8_std(&code_points, true) },
+            Ok(target.to_vec())
         );
-        assert_eq!(to_utf8_std(&empty_str, true), Ok(expected_empty_str));
-        assert_eq!(to_utf8_std(&emoji_str, true), Ok(expected_emoji_str));
-        assert_eq!(to_utf8_std(&boundary_str, true), Ok(expected_boundary_str));
-        assert_eq!(to_utf8_std(&new_line_str, true), Ok(expected_new_line_str));
-        assert_eq!(
-            to_utf8_std(&small_end_str, true),
-            Ok(expected_small_end_str)
-        );
-        assert_eq!(to_utf8_std(&big_end_str, true), Ok(expected_big_end_str));
     }
 }
