@@ -1695,7 +1695,7 @@ pub unsafe fn to_utf8_avx(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u
     Ok(utf8_bytes)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg(target_feature = "sse2")]
 unsafe fn sse2_tbl1q_u8(tbl: __m128i, idx: __m128i) -> __m128i {
     let mut tbl_array = [0u8; 16];
     let mut idx_array = [0u8; 16];
@@ -1953,26 +1953,17 @@ pub unsafe fn to_utf8_neon(utf16: &[u16], is_little_endian: bool) -> Result<Vec<
             vst1_u8(ptr.add(offset), vmovn_u16(*&chunk));
             offset += MIN_TO_UTF8_DIM_SIMD;
         } else if vmaxvq_u16(masked2) == 0 {
-            // Shift right by 6 bits to get the high 5 bits of each UTF-16 value
-            let high_bits = vshrq_n_u16(chunk, 6);
+            let high_bits = vandq_u16(vshrq_n_u16(chunk, 6), vdupq_n_u16(0b1_1111));
+            let high_bits = vmovn_u16(high_bits);
+            let low_bits = vandq_u16(chunk, vdupq_n_u16(0b11_1111));
 
-            // Mask out the lower 6 bits of each UTF-16 value
-            let low_bits = vandq_u16(chunk, *low_bits_mask);
+            let high_bytes = vorr_u8(high_bits, vdup_n_u8(0b1100_0000));
+            let low_bits = vmovn_u16(low_bits);
+            let low_bytes = vorr_u8(low_bits, vdup_n_u8(0b1000_0000));
+            let zip = vzip_u8(high_bytes, low_bytes);
 
-            // OR with 0b1100_0000 to set the high bits for the first byte of UTF-8
-            let high_bits_packed = vorrq_u16(high_bits, *low_bits_packed_mask);
-
-            // OR with 0b1000_0000 to set the high bits for the second byte of UTF-8
-            let low_bits_packed = vorrq_u16(low_bits, *low_bits_packed_mask);
-
-            // Interleave the high and low bits to form the UTF-8 bytes
-            let temp_utf8_buf = vzip1q_u8(
-                vreinterpretq_u8_u16(high_bits_packed),
-                vreinterpretq_u8_u16(low_bits_packed),
-            );
-
-            // Store the result in the output buffer
-            vst1q_u8(ptr, temp_utf8_buf);
+            vst1_u8(ptr, zip.0);
+            vst1_u8(ptr.add(MIN_TO_UTF8_DIM_SIMD), zip.1);
             offset += MIN_TO_UTF8_DIM_SIMD * 2;
         } else {
             let t0 = vreinterpretq_u16_u8(vqtbl1q_u8(
@@ -2252,33 +2243,58 @@ mod tests {
         #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
         {
             if std::arch::is_aarch64_feature_detected!("neon") {
+                // assert_eq!(
+                //     str::from_utf8(&(unsafe { to_utf8_neon(&basic_str, true) }).unwrap()),
+                //     Ok("Hello, 世界!")
+                // );
+                // assert_eq!(
+                //     unsafe { to_utf8_neon(&empty_str, true) },
+                //     Ok(expected_empty_str.clone())
+                // );
+                // assert_eq!(
+                //     unsafe { to_utf8_neon(&emoji_str, true) },
+                //     Ok(expected_emoji_str.clone())
+                // );
+                // assert_eq!(
+                //     unsafe { to_utf8_neon(&boundary_str, true) },
+                //     Ok(expected_boundary_str.clone())
+                // );
+                // assert_eq!(
+                //     unsafe { to_utf8_neon(&new_line_str, true) },
+                //     Ok(expected_new_line_str.clone())
+                // );
+                // assert_eq!(
+                //     unsafe { to_utf8_neon(&small_end_str, true) },
+                //     Ok(expected_small_end_str.clone())
+                // );
+                // assert_eq!(
+                //     unsafe { to_utf8_neon(&big_end_str, true) },
+                //     Ok(expected_big_end_str.clone())
+                // );
+
+                let code_points = vec![
+                    0x100, // U+0100
+                    0x200, // U+0200
+                    0x300, // U+0300
+                    0x400, // U+0400
+                    0x400, // U+0400
+                    0x400, // U+0400
+                    0x400, // U+0400
+                    0x400, // U+0400
+                    0x500, // U+0500
+                    0x600, // U+0600
+                    0x700, // U+0700
+                    0x7FF, // U+07FF
+                ]
+                .to_vec();
+                let target = [
+                    196, 128, 200, 128, 204, 128, 208, 128, 208, 128, 208, 128, 208, 128, 208, 128,
+                    212, 128, 216, 128, 220, 128, 223, 191,
+                ];
+
                 assert_eq!(
-                    str::from_utf8(&(unsafe { to_utf8_neon(&basic_str, true) }).unwrap()),
-                    Ok("Hello, 世界!")
-                );
-                assert_eq!(
-                    unsafe { to_utf8_neon(&empty_str, true) },
-                    Ok(expected_empty_str.clone())
-                );
-                assert_eq!(
-                    unsafe { to_utf8_neon(&emoji_str, true) },
-                    Ok(expected_emoji_str.clone())
-                );
-                assert_eq!(
-                    unsafe { to_utf8_neon(&boundary_str, true) },
-                    Ok(expected_boundary_str.clone())
-                );
-                assert_eq!(
-                    unsafe { to_utf8_neon(&new_line_str, true) },
-                    Ok(expected_new_line_str.clone())
-                );
-                assert_eq!(
-                    unsafe { to_utf8_neon(&small_end_str, true) },
-                    Ok(expected_small_end_str.clone())
-                );
-                assert_eq!(
-                    unsafe { to_utf8_neon(&big_end_str, true) },
-                    Ok(expected_big_end_str.clone())
+                    unsafe { to_utf8_neon(&code_points, true) },
+                    Ok(target.to_vec())
                 );
             }
         }
@@ -2287,14 +2303,14 @@ mod tests {
             str::from_utf8(&(to_utf8_std(&basic_str, true).unwrap())),
             Ok("Hello, 世界!")
         );
-        // assert_eq!(to_utf8_std(&empty_str, true), Ok(expected_empty_str));
-        // assert_eq!(to_utf8_std(&emoji_str, true), Ok(expected_emoji_str));
-        // assert_eq!(to_utf8_std(&boundary_str, true), Ok(expected_boundary_str));
-        // assert_eq!(to_utf8_std(&new_line_str, true), Ok(expected_new_line_str));
-        // assert_eq!(
-        //     to_utf8_std(&small_end_str, true),
-        //     Ok(expected_small_end_str)
-        // );
-        // assert_eq!(to_utf8_std(&big_end_str, true), Ok(expected_big_end_str));
+        assert_eq!(to_utf8_std(&empty_str, true), Ok(expected_empty_str));
+        assert_eq!(to_utf8_std(&emoji_str, true), Ok(expected_emoji_str));
+        assert_eq!(to_utf8_std(&boundary_str, true), Ok(expected_boundary_str));
+        assert_eq!(to_utf8_std(&new_line_str, true), Ok(expected_new_line_str));
+        assert_eq!(
+            to_utf8_std(&small_end_str, true),
+            Ok(expected_small_end_str)
+        );
+        assert_eq!(to_utf8_std(&big_end_str, true), Ok(expected_big_end_str));
     }
 }

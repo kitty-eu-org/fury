@@ -1126,8 +1126,6 @@ pub unsafe fn to_utf8_neon(utf16: &[u16], is_little_endian: bool) -> Result<Vec<
     lazy_static! {
         static ref limit1: uint16x8_t = unsafe { vdupq_n_u16(0x80) };
         static ref limit2: uint16x8_t = unsafe { vdupq_n_u16(0x800) };
-        static ref surrogate_high_start: uint16x8_t = unsafe { vdupq_n_u16(0xD800) };
-        static ref surrogate_low_end: uint16x8_t = unsafe { vdupq_n_u16(0xDFFF) };
         static ref low_bits_mask: uint16x8_t = unsafe { vdupq_n_u16(0b11_1111) };
         static ref low_bits_packed_mask: uint16x8_t = unsafe { vdupq_n_u16(0b1100_0000) };
         static ref DUP_EVEN: uint16x8_t = unsafe {
@@ -1172,15 +1170,17 @@ pub unsafe fn to_utf8_neon(utf16: &[u16], is_little_endian: bool) -> Result<Vec<
             vst1_u8(ptr.add(offset), vmovn_u16(*&chunk));
             offset += MIN_TO_UTF8_DIM_SIMD;
         } else if vmaxvq_u16(masked2) == 0 {
-            let high_bits = vshrq_n_u16(chunk, 6);
-            let low_bits = vandq_u16(chunk, *low_bits_mask);
-            let high_bits_packed = vorrq_u16(high_bits, *low_bits_packed_mask);
-            let low_bits_packed = vorrq_u16(low_bits, *low_bits_packed_mask);
-            let temp_utf8_buf = vzip1q_u8(
-                vreinterpretq_u8_u16(high_bits_packed),
-                vreinterpretq_u8_u16(low_bits_packed),
-            );
-            vst1q_u8(ptr, temp_utf8_buf);
+            let high_bits = vandq_u16(vshrq_n_u16(chunk, 6), vdupq_n_u16(0b1_1111));
+            let high_bits = vmovn_u16(high_bits);
+            let low_bits = vandq_u16(chunk, vdupq_n_u16(0b11_1111));
+
+            let high_bytes = vorr_u8(high_bits, vdup_n_u8(0b1100_0000));
+            let low_bits = vmovn_u16(low_bits);
+            let low_bytes = vorr_u8(low_bits, vdup_n_u8(0b1000_0000));
+            let zip = vzip_u8(high_bytes, low_bytes);
+
+            vst1_u8(ptr, zip.0);
+            vst1_u8(ptr.add(MIN_TO_UTF8_DIM_SIMD), zip.1);
             offset += MIN_TO_UTF8_DIM_SIMD * 2;
         } else {
             let t0 = vreinterpretq_u16_u8(vqtbl1q_u8(
