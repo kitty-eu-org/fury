@@ -1712,6 +1712,45 @@ unsafe fn sse2_tbl1q_u8(tbl: __m128i, idx: __m128i) -> __m128i {
     _mm_loadu_si128(result_array.as_ptr() as *const __m128i)
 }
 
+unsafe fn v_pack(a: __m128i, b: __m128i) -> __m128i {
+    let z = _mm_setzero_si128();
+    let maxval32 = _mm_set1_epi32(65535);
+    let delta32 = _mm_set1_epi32(32768);
+
+    let a_cmp = _mm_cmpgt_epi32(z, a);
+    let b_cmp = _mm_cmpgt_epi32(z, b);
+
+    let a_sel = _mm_xor_si128(a, _mm_and_si128(_mm_xor_si128(maxval32, a), a_cmp));
+    let b_sel = _mm_xor_si128(b, _mm_and_si128(_mm_xor_si128(maxval32, b), b_cmp));
+
+    let a1 = _mm_sub_epi32(a_sel, delta32);
+    let b1 = _mm_sub_epi32(b_sel, delta32);
+
+    let r = _mm_packs_epi32(a1, b1);
+
+    let result = _mm_sub_epi16(r, _mm_set1_epi16(-32768));
+    result
+}
+
+unsafe fn vaddvq_u16_sse(v: __m128i) -> u16 {
+    // 将 128 位向量分成两部分并相加
+    let hi64 = _mm_unpackhi_epi64(v, v);
+    let sum64 = _mm_add_epi16(v, hi64);
+
+    // 将 64 位向量分成两部分并相加
+    let hi32 = _mm_shuffle_epi32(sum64, 0b11101110);
+    let sum32 = _mm_add_epi16(sum64, hi32);
+
+    // 将 32 位向量分成两部分并相加
+    let hi16 = _mm_shufflelo_epi16(sum32, 0b11101110);
+    let sum16 = _mm_add_epi16(sum32, hi16);
+
+    // 提取最低 16 位
+    let result = _mm_extract_epi16(sum16, 0);
+
+    result as u16
+}
+
 #[cfg(target_feature = "sse2")]
 pub unsafe fn to_utf8_sse(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u8>, String> {
     let utf16_len = utf16.len();
@@ -1737,9 +1776,9 @@ pub unsafe fn to_utf8_sse(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u
 
     let remaining = utf16_len % MIN_TO_UTF8_DIM_SIMD;
     let range_end = utf16_len - remaining;
-    let aa = is_x86_feature_detected!("sse4.1");
-    assert_eq!(is_x86_feature_detected!("sse4.1"), true);
-    println!("is_x86_feature_detected: {:?}", aa);
+    // let aa = is_x86_feature_detected!("sse4.1");
+    // assert_eq!(is_x86_feature_detected!("sse4.1"), true);
+    // println!("is_x86_feature_detected: {:?}", aa);
     for i in (0..range_end).step_by(MIN_TO_UTF8_DIM_SIMD) {
         let mut chunk = _mm_loadu_si128(utf16.as_ptr().add(i) as *const __m128i);
         if !is_little_endian {
@@ -1749,7 +1788,8 @@ pub unsafe fn to_utf8_sse(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u
         let masked1 = _mm_cmplt_epi16(chunk, limit1);
         let masked2 = _mm_andnot_si128(masked1, _mm_cmplt_epi16(chunk, limit2));
 
-        if _mm_test_all_ones(masked1) == 1 {
+        if _mm_test_all_zeros(masked1, masked1) == 1 {
+            println!("c1");
             _mm_storeu_si128(
                 ptr.add(offset) as *mut __m128i,
                 _mm_packus_epi16(*&chunk, *&chunk),
@@ -1762,6 +1802,11 @@ pub unsafe fn to_utf8_sse(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u
             let low_bits = _mm_packus_epi16(low_bits, _mm_setzero_si128());
             let low_bits_arr: [u8; 16] = std::mem::transmute(low_bits);
             println!("low_bits: {:?}", low_bits_arr);
+            println!("c2");
+            let one_byte_bytemask = _mm_cmplt_epi16(chunk, limit1);
+            let t0 = _mm_slli_epi16(chunk, 2);
+            let t1 = _mm_and_si128(t0, v_0x1f);
+            let t2 = _mm_and_si128(t1, v_003f);
 
             // let low_bits = _mm_unpacklo_epi64(low_bits, _mm_setzero_si128());
 
@@ -1778,23 +1823,56 @@ pub unsafe fn to_utf8_sse(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u
             _mm_storeu_si128(ptr.add(offset) as *mut __m128i, zip);
             offset += MIN_TO_UTF8_DIM_SIMD * 2;
         } else {
-            let shuffle_mask = _mm_set_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
-            let t0 = _mm_shuffle_epi8(chunk, shuffle_mask);
+            println!("c3");
+            let values: [u8; 16] = std::mem::transmute(dup_even);
+            println!("result: {:?}", values);
+            let t0 = _mm_shuffle_epi8(chunk, dup_even);
+            let values: [i16; 8] = std::mem::transmute(t0);
+            println!("t0: {:?}", values);
             let t1 = _mm_and_si128(t0, _mm_set1_epi16(0b0011111101111111));
-            let t2 = _mm_or_si128(t1, _mm_set1_epi16(0b1000000000000000u16 as i16));
+            let t1_values: [i16; 8] = std::mem::transmute(t1);
+            println!("t1: {:?}", t1_values);
+            let aa: __m128i = _mm_set1_epi16(-32768i16);
+            let aa_values: [u16; 8] = std::mem::transmute(aa);
+            println!("a a: {:?}", aa_values);
+            let t2 = _mm_or_si128(t1, aa);
+            let t2_values: [u16; 8] = std::mem::transmute(t2);
+            println!("t2: {:?}", t2_values);
             let s0 = _mm_srli_epi16(chunk, 12);
-
+            let s0_values: [u16; 8] = std::mem::transmute(s0);
+            println!("s0: {:?}", s0_values);
             let s1 = _mm_and_si128(chunk, _mm_set1_epi16(0b0000111111000000));
+
             let s1s = _mm_slli_epi16(s1, 2);
+            let s1s_values: [u16; 8] = std::mem::transmute(s1s);
+            println!("s1s: {:?}", s1s_values);
             let s2 = _mm_or_si128(s0, s1s);
-            let s3 = _mm_or_si128(s2, _mm_set1_epi16(0b1100000011100000u16 as i16));
+            let s2_values: [u16; 8] = std::mem::transmute(s2);
+            println!("s2: {:?}", s2_values);
+            // let mask = _mm_set1_epi16(-32768i16);
+            println!("0b1100000011100000: {:?}", 0b1100000011100000i32);
+            let value_u16: __m128i = _mm_set1_epi32(49376);
+            let value_u16 = v_pack(value_u16, value_u16);
+            let value_u16_values: [u16; 8] = std::mem::transmute(value_u16);
+            println!("value_u16_values: {:?}", value_u16_values);
+            let s3 = _mm_or_si128(s2, value_u16);
+            let s3_values: [u16; 8] = std::mem::transmute(s3);
+            println!("s3: {:?}", s3_values);
 
             let v_07ff = _mm_set1_epi16(0x07FF as i16);
             let one_or_two_bytes_bytemask = _mm_cmpeq_epi16(_mm_min_epu16(chunk, v_07ff), chunk);
+            let one_or_two_bytes_bytemask_values: [u16; 8] =
+                std::mem::transmute(one_or_two_bytes_bytemask);
+            println!(
+                "one_or_two_bytes_bytemask: {:?}",
+                one_or_two_bytes_bytemask_values
+            );
             let m0 = _mm_andnot_si128(
                 one_or_two_bytes_bytemask,
                 _mm_set1_epi16(0b0100000000000000),
             );
+            let m0_values: [u16; 8] = std::mem::transmute(m0);
+            println!("m0_values: {:?}", m0_values);
             let s4 = _mm_xor_si128(s3, m0);
 
             let out0 = _mm_unpacklo_epi8(t2, s4);
@@ -1811,32 +1889,36 @@ pub unsafe fn to_utf8_sse(utf16: &[u16], is_little_endian: bool) -> Result<Vec<u
                 _mm_and_si128(one_or_two_bytes_bytemask, two_mask),
             );
 
-            // There's no direct SSE2 equivalent for vaddvq_u16, so we need to sum manually
-            let sum_temp = _mm_add_epi16(
-                _mm_add_epi16(_mm_srli_si128(combined, 8), combined),
-                _mm_add_epi16(_mm_srli_si128(combined, 4), _mm_srli_si128(combined, 12)),
-            );
-            let mask = _mm_extract_epi16(sum_temp, 0) as u16;
-
+            let combined_values: [u16; 8] = std::mem::transmute(combined);
+            println!("combined_values: {:?}", combined_values);
+            let mask = vaddvq_u16_sse(combined); // to fix
+            println!("mask: {:?}", mask);
             let (mask0, mask1) = (mask as u8, (mask >> 8) as u8);
+
             let (row0, row1) = (
                 PACK_1_2_3_UTF8_BYTES[mask0 as usize].as_ptr(),
                 PACK_1_2_3_UTF8_BYTES[mask1 as usize].as_ptr(),
             );
+            let row0_values: [u8; 8] = std::mem::transmute(row0);
+            println!("row0_values: {:?}", row0_values);
             let (len0, len1) = (*row0, *row1);
             let (shuffle0, shuffle1) = (
                 _mm_loadu_si128(row0.add(1) as *const __m128i),
                 _mm_loadu_si128(row1.add(1) as *const __m128i),
             );
+
+            let shuffle0_values: [u16; 8] = std::mem::transmute(shuffle0);
+            println!("shuffle0_values: {:?}", shuffle0_values);
+            let (len0, len1) = (*row0, *row1);
             // #[cfg(all(
             //     target_feature = "sse2",
             //     not(target_feature = "sse4.1"),
             //     not(target_feature = "sse3")
             // ))]
             // let (utf8_0, utf8_1) = (sse2_tbl1q_u8(out0, shuffle0), sse2_tbl1q_u8(out1, shuffle1));
-            let aa = is_x86_feature_detected!("sse4.1");
-            assert_eq!(is_x86_feature_detected!("sse4.1"), true);
-            println!("is_x86_feature_detected: {:?}", aa);
+            // let aa = is_x86_feature_detected!("sse4.1");
+            // assert_eq!(is_x86_feature_detected!("sse4.1"), true);
+            // println!("is_x86_feature_detected: {:?}", aa);
             // #[cfg(any(target_feature = "sse4.1", target_feature = "sse3"))]
             // let (utf8_0, utf8_1) = (
             //     _mm_shuffle_epi8(out0, shuffle0),
